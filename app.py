@@ -83,25 +83,48 @@ def branch_summary(branch_name: str):
             } for m in MONTHS
         }
     }
+def _filter_by_region(data: pd.DataFrame, region: str | None) -> pd.DataFrame:
+    """Filter rows by keyword match in Branch name (best we can do unless you have a County column)."""
+    if not region:
+        return data
+    region = region.strip().lower()
+    if not region:
+        return data
+    return data[data["Branch"].astype(str).str.lower().str.contains(region, na=False)]
 
+
+def top_shortest_wait(month="December 2025", n=5, region: str | None = None):
+    tmp = _filter_by_region(df, region)
+    return tmp[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
+        by=f"{month} Wait Time", ascending=True
+    ).head(n)
+    
 # ---- LLM router ----
 ROUTER_INSTRUCTIONS = f"""
-Return ONLY valid JSON.
+Return ONLY valid JSON (no markdown).
 
 Schema:
 {{
-  "action": one of ["top_longest_wait","top_best_efficiency","biggest_wait_increase","branch_summary","help"],
+  "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency","biggest_wait_increase","branch_summary","help"],
   "month": one of {MONTHS} or null,
   "n": integer (default 5) or null,
-  "branch": string or null
+  "branch": string or null,
+  "region": string or null
 }}
 
 Rules:
-- "longest wait" -> top_longest_wait
-- "best efficiency"/"most efficient" -> top_best_efficiency
-- "increase"/"worse wait" -> biggest_wait_increase (FY25 -> month)
-- "summary" or a branch name -> branch_summary
-- unclear -> help
+- If user asks "longest wait", "highest wait", "worst wait" -> top_longest_wait
+- If user asks "shortest wait", "lowest wait", "least wait", "minimum wait", "less wait" -> top_shortest_wait
+- If user asks "best efficiency", "most efficient" -> top_best_efficiency
+- If user asks "increase", "worse wait", "got worse" -> biggest_wait_increase (FY25 -> month)
+- If user asks "summary" OR clearly names a single branch -> branch_summary (put branch in "branch")
+- If user mentions a place/area (e.g., "Baltimore", "Largo", "Silver Spring", "County", "City") put it in "region"
+- If user does not specify month, set month=null (server will default to December 2025)
+- If user does not specify n, set n=null
+- If unclear -> help
+Examples:
+User: "Which branches in baltimore county have the lowest wait time in December 2025?"
+-> {{"action":"top_shortest_wait","month":"December 2025","n":5,"branch":null,"region":"baltimore county"}}
 """
 
 def _extract_json(text: str) -> str:
@@ -142,23 +165,42 @@ def run_tool(cmd: dict):
     month = cmd.get("month") or "December 2025"
     n = int(cmd.get("n") or 5)
     branch = cmd.get("branch")
+    region = cmd.get("region")
 
     if month not in MONTHS:
         month = "December 2025"
 
     if action == "top_longest_wait":
-        d = top_longest_wait(month, n)
+        d = _filter_by_region(df, region)
+        d = d[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
+            by=f"{month} Wait Time", ascending=False
+        ).head(n)
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
+
+    if action == "top_shortest_wait":
+        d = top_shortest_wait(month, n, region=region)
+        return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
+
     if action == "top_best_efficiency":
-        d = top_best_efficiency(month, n)
+        d = _filter_by_region(df, region)
+        d = d[["Branch", f"{month} Efficiency", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
+            by=f"{month} Efficiency", ascending=False
+        ).head(n)
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
+
     if action == "biggest_wait_increase":
-        d = biggest_wait_increase("FY25", month, n)
+        tmp = _filter_by_region(df.copy(), region)
+        tmp["Wait Change"] = tmp[f"{month} Wait Time"] - tmp["FY25 Wait Time"]
+        d = tmp[["Branch", "FY25 Wait Time", f"{month} Wait Time", "Wait Change"]].sort_values(
+            by="Wait Change", ascending=False
+        ).head(n)
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
+
     if action == "branch_summary":
         s = branch_summary(branch or "")
         return {"summary": s, "table_text": json.dumps(s, indent=2)}
-    return {"help": "Try: 'Top 5 longest wait time in December 2025' or 'Best efficiency in November 2025' or 'Summary: Largo'."}
+
+    return {"help": "Try: 'Lowest wait time in Baltimore County in December 2025' or 'Best efficiency in November 2025' or 'Summary: Largo'."}
 
 # ---- API ----
 app = FastAPI()
