@@ -41,6 +41,15 @@ for c in cust_cols:
     )
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
+# Clean wait time columns  ← ADD THIS HERE
+for c in wait_cols:
+    df[c] = (
+        df[c].astype(str)
+            .str.replace(",", "", regex=False)
+            .str.replace(" ", "", regex=False)
+    )
+    df[c] = pd.to_numeric(df[c], errors="coerce")
+
 for period in ["FY23", "FY24", "FY25"]:
     df[f"{period} Efficiency"] = df[f"{period} Customers Served"] / df[f"{period} Wait Time"]
 
@@ -48,6 +57,25 @@ for m in MONTHS:
     df[f"{m} Efficiency"] = df[f"{m} Customers Served"] / df[f"{m} Wait Time"]
 
 # ---- tools ----
+def _safe_int(x):
+    try:
+        # handle pandas NaN
+        if pd.isna(x):
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def _safe_float(x):
+    try:
+        if pd.isna(x):
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
 def top_longest_wait(month="December 2025", n=5):
     return df[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
         by=f"{month} Wait Time", ascending=False
@@ -72,14 +100,26 @@ def branch_summary(branch_name: str):
     r = row.iloc[0]
     return {
         "Branch": r["Branch"],
-        "FY23": {"served": int(r["FY23 Customers Served"]), "wait": float(r["FY23 Wait Time"]), "eff": float(r["FY23 Efficiency"])},
-        "FY24": {"served": int(r["FY24 Customers Served"]), "wait": float(r["FY24 Wait Time"]), "eff": float(r["FY24 Efficiency"])},
-        "FY25": {"served": int(r["FY25 Customers Served"]), "wait": float(r["FY25 Wait Time"]), "eff": float(r["FY25 Efficiency"])},
+        "FY23": {
+            "served": _safe_int(r["FY23 Customers Served"]),
+            "wait": _safe_float(r["FY23 Wait Time"]),
+            "eff": _safe_float(r["FY23 Efficiency"]),
+        },
+        "FY24": {
+            "served": _safe_int(r["FY24 Customers Served"]),
+            "wait": _safe_float(r["FY24 Wait Time"]),
+            "eff": _safe_float(r["FY24 Efficiency"]),
+        },
+        "FY25": {
+            "served": _safe_int(r["FY25 Customers Served"]),
+            "wait": _safe_float(r["FY25 Wait Time"]),
+            "eff": _safe_float(r["FY25 Efficiency"]),
+        },
         "Monthly_2025": {
             m: {
-                "served": int(r[f"{m} Customers Served"]),
-                "wait": float(r[f"{m} Wait Time"]),
-                "eff": float(r[f"{m} Efficiency"]),
+                "served": _safe_int(r[f"{m} Customers Served"]),
+                "wait": _safe_float(r[f"{m} Wait Time"]),
+                "eff": _safe_float(r[f"{m} Efficiency"]),
             } for m in MONTHS
         }
     }
@@ -140,7 +180,7 @@ def route_intent(user_text: str) -> dict:
     try:
         return json.loads(_extract_json(raw))
     except Exception:
-        return {"action": "help", "month": None, "n": None, "branch": None}
+      return {"action": "help", "month": None, "n": None, "branch": None, "region": None}
 
 def explain(user_text: str, tool_result_text: str) -> str:
     prompt = f"""You are a public-service operations analyst.
