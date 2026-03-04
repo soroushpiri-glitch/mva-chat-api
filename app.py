@@ -14,7 +14,7 @@ from google import genai
 load_dotenv()  # reads .env locally; in deployment you'll set env vars in the host UI
 
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+
 
 MONTHS = ["July 2025","August 2025","September 2025","October 2025","November 2025","December 2025"]
 
@@ -23,9 +23,12 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # ---- load + prep data ----
 BASE_DIR = os.path.dirname(__file__)
-CSV_PATH = os.path.join(BASE_DIR, "data", "MVA_Customers_Served_&_Wait_Time_by_Branch_20260303.csv")
 
+from pathlib import Path
+CSV_PATH = Path(__file__).parent / "Data" / "MVA_Customers_Served_&_Wait_Time_by_Branch_20260303.csv"
 df = pd.read_csv(CSV_PATH)
+
+
 
 cust_cols = [c for c in df.columns if "Customers Served" in c]
 wait_cols = [c for c in df.columns if "Wait Time" in c]
