@@ -1,7 +1,7 @@
 import os
 import re
 import json
-from typing import Optional
+from pathlib import Path
 
 import pandas as pd
 from fastapi import FastAPI
@@ -10,25 +10,25 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 from google import genai
 
-# ---- config ----
-load_dotenv()  # reads .env locally; in deployment you'll set env vars in the host UI
-
-
-
+load_dotenv()
 
 MONTHS = ["July 2025","August 2025","September 2025","October 2025","November 2025","December 2025"]
 
-# Gemini client reads GEMINI_API_KEY / GOOGLE_API_KEY from environment
+if not os.getenv("GEMINI_API_KEY"):
+    raise RuntimeError("GEMINI_API_KEY is not set in environment variables.")
+
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# ---- load + prep data ----
-BASE_DIR = os.path.dirname(__file__)
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = BASE_DIR / "Data"
+CSV_PATH = DATA_DIR / "MVA_Customers_Served_&_Wait_Time_by_Branch_20260303.csv"
 
-from pathlib import Path
-CSV_PATH = Path(__file__).parent / "Data" / "MVA_Customers_Served_&_Wait_Time_by_Branch_20260303.csv"
+if not CSV_PATH.exists():
+    raise FileNotFoundError(
+        f"CSV not found at: {CSV_PATH}. Files in Data/: {[p.name for p in DATA_DIR.glob('*')]}"
+    )
+
 df = pd.read_csv(CSV_PATH)
-
-
 
 cust_cols = [c for c in df.columns if "Customers Served" in c]
 wait_cols = [c for c in df.columns if "Wait Time" in c]
@@ -188,3 +188,7 @@ def chat(payload: ChatIn):
 
     answer = explain(payload.message, tool_out.get("table_text", ""))
     return {"command": cmd, "answer": answer, "data": tool_out}
+
+@app.get("/")
+def root():
+    return {"ok": True, "docs": "/docs", "health": "/health"}
