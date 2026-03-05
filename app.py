@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import requests
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +17,11 @@ MONTHS = ["July 2025","August 2025","September 2025","October 2025","November 20
 
 if not os.getenv("GEMINI_API_KEY"):
     raise RuntimeError("GEMINI_API_KEY is not set in environment variables.")
-
+    
+if not os.getenv("MAPBOX_TOKEN"):
+    raise RuntimeError("MAPBOX_TOKEN is not set in environment variables.")
+    
+MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -29,7 +34,20 @@ if not CSV_PATH.exists():
     )
 
 df = pd.read_csv(CSV_PATH)
-
+# Coordinates for MVA branches (used for traffic routing)
+BRANCH_COORDS = {
+    "Annapolis": (38.9784, -76.4922),
+    "Baltimore City": (39.2904, -76.6122),
+    "Bel Air": (39.5359, -76.3483),
+    "Columbia": (39.2037, -76.8610),
+    "Essex": (39.3045, -76.4683),
+    "Frederick": (39.4143, -77.4105),
+    "Gaithersburg": (39.1434, -77.2014),
+    "Glen Burnie": (39.1626, -76.6247),
+    "Largo": (38.9058, -76.8430),
+    "Parkville": (39.3777, -76.5400),
+    "White Oak": (39.0384, -76.9903),
+}
 cust_cols = [c for c in df.columns if "Customers Served" in c]
 wait_cols = [c for c in df.columns if "Wait Time" in c]
 
@@ -138,35 +156,94 @@ def top_shortest_wait(month="December 2025", n=5, region: str | None = None):
     return tmp[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
         by=f"{month} Wait Time", ascending=True
     ).head(n)
-    
+
+def traffic_eta_minutes(origin_lat: float, origin_lon: float, branch_name: str):
+    """Returns current traffic ETA (minutes) from origin -> branch using Mapbox driving-traffic."""
+    if not branch_name:
+        return {"error": "Missing branch name."}
+
+    # case-insensitive match
+    key_map = {k.lower(): k for k in BRANCH_COORDS.keys()}
+    bkey = key_map.get(branch_name.strip().lower())
+    if not bkey:
+        return {"error": f"No coordinates found for branch '{branch_name}'. Available: {list(BRANCH_COORDS.keys())}"}
+
+    dest_lat, dest_lon = BRANCH_COORDS[bkey]
+
+    url = (
+        f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/"
+        f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
+    )
+
+    params = {
+        "access_token": MAPBOX_TOKEN,
+        "overview": "false",
+        "alternatives": "false",
+        "geometries": "geojson",
+    }
+
+    r = requests.get(url, params=params, timeout=20)
+    if r.status_code != 200:
+        return {"error": f"Mapbox error {r.status_code}: {r.text[:200]}"}
+
+    data = r.json()
+    routes = data.get("routes", [])
+    if not routes:
+        return {"error": "No route returned from Mapbox."}
+
+    duration_sec = routes[0]["duration"]
+    return {
+        "origin": {"lat": origin_lat, "lon": origin_lon},
+        "branch": bkey,
+        "eta_minutes": round(duration_sec / 60, 1),
+    }
 # ---- LLM router ----
 ROUTER_INSTRUCTIONS = f"""
 Return ONLY valid JSON (no markdown).
 
 Schema:
 {{
-  "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency","biggest_wait_increase","branch_summary","help"],
+  "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency","biggest_wait_increase","branch_summary","traffic_eta","help"],
   "month": one of {MONTHS} or null,
   "n": integer (default 5) or null,
   "branch": string or null,
-  "region": string or null
+  "region": string or null,
+  "origin_lat": number or null,
+  "origin_lon": number or null
 }}
 
 Rules:
+- If user asks "traffic", "ETA", "drive time", "travel time" -> traffic_eta
+  - Put destination branch name in "branch"
+  - If user gives coordinates, set origin_lat/origin_lon
 - If user asks "longest wait", "highest wait", "worst wait" -> top_longest_wait
-- If user asks "shortest wait", "lowest wait", "least wait", "minimum wait", "less wait" -> top_shortest_wait
+- If user asks "shortest wait", "lowest wait", "least wait", "minimum wait" -> top_shortest_wait
 - If user asks "best efficiency", "most efficient" -> top_best_efficiency
-- If user asks "increase", "worse wait", "got worse" -> biggest_wait_increase (FY25 -> month)
+- If user asks "increase", "got worse" -> biggest_wait_increase (FY25 -> month)
 - If user asks "summary" OR clearly names a single branch -> branch_summary (put branch in "branch")
-- If user mentions a place/area (e.g., "Baltimore", "Largo", "Silver Spring", "County", "City") put it in "region"
-- If user does not specify month, set month=null (server will default to December 2025)
+- If user mentions a place/area, put it in "region"
+- If user does not specify month, set month=null
 - If user does not specify n, set n=null
 - If unclear -> help
-Examples:
-User: "Which branches in baltimore county have the lowest wait time in December 2025?"
--> {{"action":"top_shortest_wait","month":"December 2025","n":5,"branch":null,"region":"baltimore county"}}
-"""
 
+Examples:
+User: "Traffic ETA from 39.29,-76.61 to Largo"
+-> {{"action":"traffic_eta","branch":"Largo","origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null,"region":null}}
+"""
+COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
+
+def extract_coords_from_text(text: str):
+    """
+    Returns (lat, lon) if the user typed something like '39.29,-76.61'
+    or None if not found.
+    """
+    m = COORD_RE.search(text or "")
+    if not m:
+        return None
+    lat = float(m.group(1))
+    lon = float(m.group(2))
+    return lat, lon
+    
 def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text, flags=re.S)
     return m.group(0) if m else text
@@ -178,9 +255,19 @@ def route_intent(user_text: str) -> dict:
     )
     raw = (resp.text or "").strip()
     try:
-        return json.loads(_extract_json(raw))
+        cmd = json.loads(_extract_json(raw))
     except Exception:
-      return {"action": "help", "month": None, "n": None, "branch": None, "region": None}
+        cmd = {"action": "help", "month": None, "n": None, "branch": None, "region": None,
+               "origin_lat": None, "origin_lon": None}
+
+    # If traffic question and coords missing, try regex extraction
+    if cmd.get("action") == "traffic_eta":
+        if cmd.get("origin_lat") is None or cmd.get("origin_lon") is None:
+            coords = extract_coords_from_text(user_text)
+            if coords:
+                cmd["origin_lat"], cmd["origin_lon"] = coords
+
+    return cmd
 
 def explain(user_text: str, tool_result_text: str) -> str:
     prompt = f"""You are a public-service operations analyst.
@@ -206,7 +293,19 @@ def run_tool(cmd: dict):
     n = int(cmd.get("n") or 5)
     branch = cmd.get("branch")
     region = cmd.get("region")
+    origin_lat = cmd.get("origin_lat")
+    origin_lon = cmd.get("origin_lon")
+    
+    if action == "traffic_eta":
+        if not branch:
+            return {"help": "Please provide a destination branch name (e.g., 'Traffic ETA to Largo from 39.29,-76.61')."}
 
+        if origin_lat is None or origin_lon is None:
+            return {"help": "Please provide your origin coordinates like: 39.29,-76.61 (lat,lon)."}
+
+        result = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
+        return {"traffic": result, "table_text": json.dumps(result, indent=2)}
+        
     if month not in MONTHS:
         month = "December 2025"
 
@@ -265,8 +364,17 @@ def health():
 def chat(payload: ChatIn):
     cmd = route_intent(payload.message)
     tool_out = run_tool(cmd)
+
     if "help" in tool_out:
         return {"command": cmd, "answer": tool_out["help"], "data": tool_out}
+
+    # Special handling for traffic
+    if "traffic" in tool_out:
+        t = tool_out["traffic"]
+        if "error" in t:
+            return {"command": cmd, "answer": t["error"], "data": tool_out}
+
+        return {"command": cmd, "answer": f"Current driving ETA to {t['branch']}: {t['eta_minutes']} minutes.", "data": tool_out}
 
     answer = explain(payload.message, tool_out.get("table_text", ""))
     return {"command": cmd, "answer": answer, "data": tool_out}
