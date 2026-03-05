@@ -2,6 +2,7 @@ import os
 import re
 import json
 import requests
+from urllib.parse import quote
 from pathlib import Path
 
 import pandas as pd
@@ -157,6 +158,31 @@ def top_shortest_wait(month="December 2025", n=5, region: str | None = None):
         by=f"{month} Wait Time", ascending=True
     ).head(n)
 
+def geocode_address(address: str):
+    """Convert address (e.g., 'Baltimore, MD') to coordinates using Mapbox."""
+    
+    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{quote(address)}.json"
+
+    params = {
+        "access_token": MAPBOX_TOKEN,
+        "limit": 1
+    }
+
+    r = requests.get(url, params=params, timeout=20)
+
+    if r.status_code != 200:
+        return None
+
+    data = r.json()
+    features = data.get("features")
+
+    if not features:
+        return None
+
+    lon, lat = features[0]["center"]
+
+    return lat, lon
+
 def traffic_eta_minutes(origin_lat: float, origin_lon: float, branch_name: str):
     """Returns current traffic ETA (minutes) from origin -> branch using Mapbox driving-traffic."""
     if not branch_name:
@@ -216,6 +242,7 @@ Rules:
 - If user asks "traffic", "ETA", "drive time", "travel time" -> traffic_eta
   - Put destination branch name in "branch"
   - If user gives coordinates, set origin_lat/origin_lon
+  - If user provides an address instead of coordinates (e.g., "Baltimore, MD", "JHU Hospital"), put it in "region"
 - If user asks "longest wait", "highest wait", "worst wait" -> top_longest_wait
 - If user asks "shortest wait", "lowest wait", "least wait", "minimum wait" -> top_shortest_wait
 - If user asks "best efficiency", "most efficient" -> top_best_efficiency
@@ -229,6 +256,9 @@ Rules:
 Examples:
 User: "Traffic ETA from 39.29,-76.61 to Largo"
 -> {{"action":"traffic_eta","branch":"Largo","origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null,"region":null}}
+
+User: "Traffic ETA from Baltimore, MD to Largo"
+-> {{"action":"traffic_eta","branch":"Largo","origin_lat":null,"origin_lon":null,"month":null,"n":null,"region":"Baltimore, MD"}}
 """
 COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
 
@@ -296,12 +326,21 @@ def run_tool(cmd: dict):
     origin_lat = cmd.get("origin_lat")
     origin_lon = cmd.get("origin_lon")
     
-    if action == "traffic_eta":
+        if action == "traffic_eta":
         if not branch:
-            return {"help": "Please provide a destination branch name (e.g., 'Traffic ETA to Largo from 39.29,-76.61')."}
+            return {"help": "Please provide a destination branch name (e.g., 'Traffic ETA to Largo from Baltimore, MD' or 'Traffic ETA from 39.29,-76.61 to Largo')."}
 
+        # If coords missing, try to use address from region
         if origin_lat is None or origin_lon is None:
-            return {"help": "Please provide your origin coordinates like: 39.29,-76.61 (lat,lon)."}
+            address = (region or "").strip()
+            if address:
+                coords = geocode_address(address)
+                if coords:
+                    origin_lat, origin_lon = coords
+                else:
+                    return {"help": f"Could not locate address '{address}'. Try a more specific address (e.g., 'Baltimore, MD' or 'Johns Hopkins Hospital, Baltimore, MD')."}
+            else:
+                return {"help": "Please provide your origin as coordinates (lat,lon) or an address like 'Baltimore, MD'."}
 
         result = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
         return {"traffic": result, "table_text": json.dumps(result, indent=2)}
