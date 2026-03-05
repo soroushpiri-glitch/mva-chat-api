@@ -161,7 +161,7 @@ def top_shortest_wait(month="December 2025", n=5, region: str | None = None):
 def geocode_address(address: str):
     """Convert address (e.g., 'Baltimore, MD') to coordinates using Mapbox."""
     
-    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{quote(address)}.json"
+    url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{quote(address, safe='')}.json"
 
     params = {
         "access_token": MAPBOX_TOKEN,
@@ -292,7 +292,7 @@ def route_intent(user_text: str) -> dict:
 
     # If traffic question and coords missing, try regex extraction
     if cmd.get("action") == "traffic_eta":
-        if cmd.get("origin_lat") is None or cmd.get("origin_lon") is None:
+        if cmd.get("origin_lat") is None and cmd.get("origin_lon") is None:
             coords = extract_coords_from_text(user_text)
             if coords:
                 cmd["origin_lat"], cmd["origin_lon"] = coords
@@ -325,12 +325,15 @@ def run_tool(cmd: dict):
     region = cmd.get("region")
     origin_lat = cmd.get("origin_lat")
     origin_lon = cmd.get("origin_lon")
-    
-        if action == "traffic_eta":
-        if not branch:
-            return {"help": "Please provide a destination branch name (e.g., 'Traffic ETA to Largo from Baltimore, MD' or 'Traffic ETA from 39.29,-76.61 to Largo')."}
 
-        # If coords missing, try to use address from region
+    # --- Traffic ETA tool ---
+    if action == "traffic_eta":
+        if not branch:
+            return {
+                "help": "Please provide a destination branch name (e.g., 'Traffic ETA to Largo from Baltimore, MD' or 'Traffic ETA from 39.29,-76.61 to Largo')."
+            }
+
+        # If coords missing, try address from region
         if origin_lat is None or origin_lon is None:
             address = (region or "").strip()
             if address:
@@ -338,12 +341,17 @@ def run_tool(cmd: dict):
                 if coords:
                     origin_lat, origin_lon = coords
                 else:
-                    return {"help": f"Could not locate address '{address}'. Try a more specific address (e.g., 'Baltimore, MD' or 'Johns Hopkins Hospital, Baltimore, MD')."}
+                    return {
+                        "help": f"Could not locate address '{address}'. Try a more specific address (e.g., 'Baltimore, MD' or 'Johns Hopkins Hospital, Baltimore, MD')."
+                    }
             else:
-                return {"help": "Please provide your origin as coordinates (lat,lon) or an address like 'Baltimore, MD'."}
+                return {
+                    "help": "Please provide your origin as coordinates (lat,lon) or an address like 'Baltimore, MD'."
+                }
 
         result = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
         return {"traffic": result, "table_text": json.dumps(result, indent=2)}
+
         
     if month not in MONTHS:
         month = "December 2025"
