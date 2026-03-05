@@ -223,13 +223,33 @@ def traffic_eta_minutes(origin_lat: float, origin_lon: float, branch_name: str):
         "branch": bkey,
         "eta_minutes": round(duration_sec / 60, 1),
     }
+
+def branch_wait_time(branch_name: str, month: str = "December 2025"):
+    if not branch_name:
+        return {"error": "Missing branch name."}
+
+    if month not in MONTHS:
+        month = "December 2025"
+
+    row = df[df["Branch"].astype(str).str.lower() == branch_name.strip().lower()]
+    if row.empty:
+        return {"error": f"Branch '{branch_name}' not found."}
+
+    val = row.iloc[0][f"{month} Wait Time"]
+    try:
+        wait = float(val)
+    except Exception:
+        wait = None
+
+    return {"branch": row.iloc[0]["Branch"], "month": month, "wait_minutes": wait}
 # ---- LLM router ----
 ROUTER_INSTRUCTIONS = f"""
 Return ONLY valid JSON (no markdown).
 
 Schema:
 {{
-  "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency","biggest_wait_increase","branch_summary","traffic_eta","help"],
+ "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency",
+                  "biggest_wait_increase","branch_summary","traffic_eta","travel_plus_wait","help"],
   "month": one of {MONTHS} or null,
   "n": integer (default 5) or null,
   "branch": string or null,
@@ -239,6 +259,10 @@ Schema:
 }}
 
 Rules:
+- If user asks travel time AND mentions wait time / "historical wait" / "including wait" / "total time" -> travel_plus_wait
+  - destination branch -> "branch"
+  - origin address -> "region" (or add a new field origin_address; see note below)
+  - month -> if missing set month=null
 - If user asks "traffic", "ETA", "drive time", "travel time" -> traffic_eta
   - Put destination branch name in "branch"
   - If user gives coordinates, set origin_lat/origin_lon
@@ -259,6 +283,9 @@ User: "Traffic ETA from 39.29,-76.61 to Largo"
 
 User: "Traffic ETA from Baltimore, MD to Largo"
 -> {{"action":"traffic_eta","branch":"Largo","origin_lat":null,"origin_lon":null,"month":null,"n":null,"region":"Baltimore, MD"}}
+
+User: "How long from 2907 Fallstaff Road, Baltimore, MD to Largo including Largo historical wait time?"
+-> {{"action":"travel_plus_wait","branch":"Largo","region":"2907 Fallstaff Road, Baltimore, MD","month":null,"n":null,"origin_lat":null,"origin_lon":null}}
 """
 COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
 
@@ -291,8 +318,8 @@ def route_intent(user_text: str) -> dict:
                "origin_lat": None, "origin_lon": None}
 
     # If traffic question and coords missing, try regex extraction
-    if cmd.get("action") == "traffic_eta":
-        if cmd.get("origin_lat") is None and cmd.get("origin_lon") is None:
+    if cmd.get("action") in ("traffic_eta", "travel_plus_wait"):
+        if cmd.get("origin_lat") is None or cmd.get("origin_lon") is None:
             coords = extract_coords_from_text(user_text)
             if coords:
                 cmd["origin_lat"], cmd["origin_lon"] = coords
@@ -326,32 +353,54 @@ def run_tool(cmd: dict):
     origin_lat = cmd.get("origin_lat")
     origin_lon = cmd.get("origin_lon")
 
-    # --- Traffic ETA tool ---
-    if action == "traffic_eta":
+       # --- Combined: drive ETA + historical wait ---
+    if action == "travel_plus_wait":
+        month = cmd.get("month") or "December 2025"
+        branch = cmd.get("branch")
+        origin_lat = cmd.get("origin_lat")
+        origin_lon = cmd.get("origin_lon")
+        origin_address = (cmd.get("region") or "").strip()  # using region as origin address
+
         if not branch:
-            return {
-                "help": "Please provide a destination branch name (e.g., 'Traffic ETA to Largo from Baltimore, MD' or 'Traffic ETA from 39.29,-76.61 to Largo')."
-            }
+            return {"help": "Please provide a destination branch (e.g., Largo)."}
 
-        # If coords missing, try address from region
+        # Resolve origin coords:
         if origin_lat is None or origin_lon is None:
-            address = (region or "").strip()
-            if address:
-                coords = geocode_address(address)
-                if coords:
-                    origin_lat, origin_lon = coords
-                else:
-                    return {
-                        "help": f"Could not locate address '{address}'. Try a more specific address (e.g., 'Baltimore, MD' or 'Johns Hopkins Hospital, Baltimore, MD')."
-                    }
-            else:
-                return {
-                    "help": "Please provide your origin as coordinates (lat,lon) or an address like 'Baltimore, MD'."
-                }
+            if not origin_address:
+                return {"help": "Please provide an origin address (e.g., '2907 Fallstaff Road, Baltimore, MD') or coordinates."}
 
-        result = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
-        return {"traffic": result, "table_text": json.dumps(result, indent=2)}
+            coords = geocode_address(origin_address)
+            if not coords:
+                return {"help": f"Could not locate address '{origin_address}'. Try a more specific address."}
 
+            origin_lat, origin_lon = coords
+
+        # 1) Current driving ETA
+        traffic = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
+        if "error" in traffic:
+            return {"travel_plus_wait": {"traffic": traffic}, "table_text": json.dumps(traffic, indent=2)}
+
+        # 2) Historical wait time at destination branch
+        wait_info = branch_wait_time(branch, month=month)
+        if "error" in wait_info:
+            result = {"traffic": traffic, "wait": wait_info}
+            return {"travel_plus_wait": result, "table_text": json.dumps(result, indent=2)}
+
+        wait_min = wait_info.get("wait_minutes")
+        total_min = None
+        if wait_min is not None:
+            total_min = round(float(traffic["eta_minutes"]) + float(wait_min), 1)
+
+        result = {
+            "origin_address": origin_address or {"lat": origin_lat, "lon": origin_lon},
+            "destination_branch": wait_info["branch"],
+            "drive_eta_minutes": traffic["eta_minutes"],
+            "historical_wait_minutes": wait_min,
+            "wait_month": wait_info["month"],
+            "estimated_total_minutes": total_min,
+        }
+
+        return {"travel_plus_wait": result, "table_text": json.dumps(result, indent=2)}
         
     if month not in MONTHS:
         month = "December 2025"
@@ -415,17 +464,49 @@ def chat(payload: ChatIn):
     if "help" in tool_out:
         return {"command": cmd, "answer": tool_out["help"], "data": tool_out}
 
+    # Special handling for combined travel+wait
+    if "travel_plus_wait" in tool_out:
+        r = tool_out["travel_plus_wait"]
+
+        # handle errors
+        if isinstance(r, dict) and "traffic" in r and isinstance(r["traffic"], dict) and "error" in r["traffic"]:
+            return {"command": cmd, "answer": r["traffic"]["error"], "data": tool_out}
+
+        total = r.get("estimated_total_minutes")
+        if total is None:
+            return {
+                "command": cmd,
+                "answer": (
+                    f"Drive ETA to {r['destination_branch']}: {r['drive_eta_minutes']} min. "
+                    f"(No wait-time value available for {r['wait_month']})."
+                ),
+                "data": tool_out,
+            }
+
+        return {
+            "command": cmd,
+            "answer": (
+                f"Estimated total time to {r['destination_branch']} ≈ {total} minutes "
+                f"({r['drive_eta_minutes']} min driving now + {r['historical_wait_minutes']} min historical wait for {r['wait_month']})."
+            ),
+            "data": tool_out,
+        }
+
     # Special handling for traffic
     if "traffic" in tool_out:
         t = tool_out["traffic"]
         if "error" in t:
             return {"command": cmd, "answer": t["error"], "data": tool_out}
+        return {
+            "command": cmd,
+            "answer": f"Current driving ETA to {t['branch']}: {t['eta_minutes']} minutes.",
+            "data": tool_out,
+        }
 
-        return {"command": cmd, "answer": f"Current driving ETA to {t['branch']}: {t['eta_minutes']} minutes.", "data": tool_out}
-
+    # Everything else -> analyst explanation
     answer = explain(payload.message, tool_out.get("table_text", ""))
     return {"command": cmd, "answer": answer, "data": tool_out}
-
+    
 @app.get("/")
 def root():
     return {"ok": True, "docs": "/docs", "health": "/health"}
