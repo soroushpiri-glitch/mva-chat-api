@@ -249,7 +249,7 @@ Return ONLY valid JSON (no markdown).
 Schema:
 {{
  "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency",
-                  "biggest_wait_increase","branch_summary","traffic_eta","travel_plus_wait","help"],
+                  "biggest_wait_increase","branch_summary","traffic_eta","travel_plus_wait","best_branch_total_time","help"],
   "month": one of {MONTHS} or null,
   "n": integer (default 5) or null,
   "branch": string or null,
@@ -259,6 +259,10 @@ Schema:
 }}
 
 Rules:
+- If user asks "best branch", "fastest branch", "least total time", "shortest total time", "best option for me" considering traffic and wait -> best_branch_total_time
+  - Put origin address in "region" if address is given
+  - Put origin_lat/origin_lon if coordinates are given
+  - If month is missing, set month=null
 - If user asks travel time AND mentions wait time / "historical wait" / "including wait" / "total time" -> travel_plus_wait
   - destination branch -> "branch"
   - origin address -> "region" (or add a new field origin_address; see note below)
@@ -286,9 +290,47 @@ User: "Traffic ETA from Baltimore, MD to Largo"
 
 User: "How long from 2907 Fallstaff Road, Baltimore, MD to Largo including Largo historical wait time?"
 -> {{"action":"travel_plus_wait","branch":"Largo","region":"2907 Fallstaff Road, Baltimore, MD","month":null,"n":null,"origin_lat":null,"origin_lon":null}}
+
+User: "Which MVA branch is best for me from Baltimore, MD considering traffic and wait time?"
+-> {{"action":"best_branch_total_time","branch":null,"region":"Baltimore, MD","origin_lat":null,"origin_lon":null,"month":null,"n":null}}
+
+User: "Fastest MVA branch for me from 39.29,-76.61 including wait time"
+-> {{"action":"best_branch_total_time","branch":null,"region":null,"origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null}}
 """
 COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
+def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str = "December 2025"):
+    results = []
 
+    for branch_name in BRANCH_COORDS.keys():
+        traffic = traffic_eta_minutes(origin_lat, origin_lon, branch_name)
+        if "error" in traffic:
+            continue
+
+        wait_info = branch_wait_time(branch_name, month=month)
+        wait_min = wait_info.get("wait_minutes")
+
+        if wait_min is None:
+            continue
+
+        total_min = round(float(traffic["eta_minutes"]) + float(wait_min), 1)
+
+        results.append({
+            "branch": branch_name,
+            "drive_eta_minutes": traffic["eta_minutes"],
+            "historical_wait_minutes": wait_min,
+            "wait_month": month,
+            "estimated_total_minutes": total_min,
+        })
+
+    if not results:
+        return {"error": "Could not calculate total time for any branch."}
+
+    results = sorted(results, key=lambda x: x["estimated_total_minutes"])
+
+    return {
+        "best_branch": results[0],
+        "all_ranked_branches": results
+    }
 def extract_coords_from_text(text: str):
     """
     Returns (lat, lon) if the user typed something like '39.29,-76.61'
@@ -401,6 +443,29 @@ def run_tool(cmd: dict):
         }
 
         return {"travel_plus_wait": result, "table_text": json.dumps(result, indent=2)}
+           # --- Best branch by combined drive + wait time ---
+    if action == "best_branch_total_time":
+        month = cmd.get("month") or "December 2025"
+        origin_lat = cmd.get("origin_lat")
+        origin_lon = cmd.get("origin_lon")
+        origin_address = (cmd.get("region") or "").strip()
+
+        if origin_lat is None or origin_lon is None:
+            if not origin_address:
+                return {
+                    "help": "Please provide an origin address like 'Baltimore, MD' or coordinates like '39.29,-76.61'."
+                }
+
+            coords = geocode_address(origin_address)
+            if not coords:
+                return {
+                    "help": f"Could not locate address '{origin_address}'. Try a more specific address."
+                }
+
+            origin_lat, origin_lon = coords
+
+        result = best_branch_by_total_time(float(origin_lat), float(origin_lon), month=month)
+        return {"best_branch_total_time": result, "table_text": json.dumps(result, indent=2)}
         
     if month not in MONTHS:
         month = "December 2025"
@@ -491,7 +556,22 @@ def chat(payload: ChatIn):
             ),
             "data": tool_out,
         }
+    if "best_branch_total_time" in tool_out:
+        r = tool_out["best_branch_total_time"]
 
+        if "error" in r:
+            return {"command": cmd, "answer": r["error"], "data": tool_out}
+
+        best = r["best_branch"]
+        return {
+            "command": cmd,
+            "answer": (
+                f"Best branch right now is {best['branch']} "
+                f"with an estimated total time of {best['estimated_total_minutes']} minutes "
+                f"({best['drive_eta_minutes']} min driving + {best['historical_wait_minutes']} min wait in {best['wait_month']})."
+            ),
+            "data": tool_out,
+        }
     # Special handling for traffic
     if "traffic" in tool_out:
         t = tool_out["traffic"]
