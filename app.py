@@ -248,17 +248,23 @@ Return ONLY valid JSON (no markdown).
 
 Schema:
 {{
- "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency",
-                  "biggest_wait_increase","branch_summary","traffic_eta","travel_plus_wait","best_branch_total_time","help"],
+"action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency",
+                  "biggest_wait_increase","branch_summary","traffic_eta",
+                  "travel_plus_wait","best_branch_total_time","best_branch_with_delay","help"],
   "month": one of {MONTHS} or null,
   "n": integer (default 5) or null,
   "branch": string or null,
   "region": string or null,
   "origin_lat": number or null,
-  "origin_lon": number or null
+  "origin_lon": number or null,
+  "extra_delay_minutes": number or null
 }}
 
 Rules:
+- If user asks which branch to go to and mentions an extra traffic jam / delay / added traffic minutes -> best_branch_with_delay
+  - origin address -> "region"
+  - extra delay minutes -> "extra_delay_minutes"
+  - month -> if missing set month=null
 - If user asks "best branch", "fastest branch", "least total time", "shortest total time", "best option for me" considering traffic and wait -> best_branch_total_time
   - Put origin address in "region" if address is given
   - Put origin_lat/origin_lon if coordinates are given
@@ -296,7 +302,18 @@ User: "Which MVA branch is best for me from Baltimore, MD considering traffic an
 
 User: "Fastest MVA branch for me from 39.29,-76.61 including wait time"
 -> {{"action":"best_branch_total_time","branch":null,"region":null,"origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null}}
+
+User: "I am currently on Fallstaff Road and there is a 10 minute traffic jam. Which branch should I go to?"
+-> {{"action":"best_branch_with_delay","branch":null,"region":"Fallstaff Road, Baltimore, MD","origin_lat":null,"origin_lon":null,"extra_delay_minutes":10,"month":null,"n":null}}
 """
+DELAY_RE = re.compile(r"(\d+)\s*(?:minute|min)\s*(?:traffic jam|delay|extra traffic|jam)", re.I)
+
+def extract_delay_from_text(text: str):
+    m = DELAY_RE.search(text or "")
+    if not m:
+        return None
+    return int(m.group(1))
+    
 COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
 def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str = "December 2025"):
     results = []
@@ -331,6 +348,43 @@ def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str =
         "best_branch": results[0],
         "all_ranked_branches": results
     }
+    def best_branch_with_delay(origin_lat: float, origin_lon: float, extra_delay_minutes: float = 0, month: str = "December 2025"):
+    results = []
+
+    for branch_name in BRANCH_COORDS.keys():
+        traffic = traffic_eta_minutes(origin_lat, origin_lon, branch_name)
+        if "error" in traffic:
+            continue
+
+        wait_info = branch_wait_time(branch_name, month=month)
+        wait_min = wait_info.get("wait_minutes")
+
+        if wait_min is None:
+            continue
+
+        adjusted_drive = round(float(traffic["eta_minutes"]) + float(extra_delay_minutes), 1)
+        total_min = round(adjusted_drive + float(wait_min), 1)
+
+        results.append({
+            "branch": branch_name,
+            "drive_eta_minutes": traffic["eta_minutes"],
+            "extra_delay_minutes": float(extra_delay_minutes),
+            "adjusted_drive_minutes": adjusted_drive,
+            "historical_wait_minutes": wait_min,
+            "wait_month": month,
+            "estimated_total_minutes": total_min,
+        })
+
+    if not results:
+        return {"error": "Could not calculate total time for any branch."}
+
+    results = sorted(results, key=lambda x: x["estimated_total_minutes"])
+
+    return {
+        "best_branch": results[0],
+        "all_ranked_branches": results
+    }
+
 def extract_coords_from_text(text: str):
     """
     Returns (lat, lon) if the user typed something like '39.29,-76.61'
@@ -356,11 +410,25 @@ def route_intent(user_text: str) -> dict:
     try:
         cmd = json.loads(_extract_json(raw))
     except Exception:
-        cmd = {"action": "help", "month": None, "n": None, "branch": None, "region": None,
-               "origin_lat": None, "origin_lon": None}
+    cmd = {
+            "action": "help",
+            "month": None,
+            "n": None,
+            "branch": None,
+            "region": None,
+            "origin_lat": None,
+            "origin_lon": None,
+            "extra_delay_minutes": None
+        }
 
-    # If traffic question and coords missing, try regex extraction
-    if cmd.get("action") in ("traffic_eta", "travel_plus_wait"):
+    # Add this here
+    if cmd.get("extra_delay_minutes") is None:
+        delay = extract_delay_from_text(user_text)
+        if delay is not None:
+            cmd["extra_delay_minutes"] = delay
+
+    # Existing coordinate extraction
+    if cmd.get("action") in ("traffic_eta", "travel_plus_wait", "best_branch_total_time", "best_branch_with_delay"):
         if cmd.get("origin_lat") is None or cmd.get("origin_lon") is None:
             coords = extract_coords_from_text(user_text)
             if coords:
@@ -394,6 +462,7 @@ def run_tool(cmd: dict):
     region = cmd.get("region")
     origin_lat = cmd.get("origin_lat")
     origin_lon = cmd.get("origin_lon")
+    
 
        # --- Combined: drive ETA + historical wait ---
     if action == "travel_plus_wait":
@@ -443,6 +512,35 @@ def run_tool(cmd: dict):
         }
 
         return {"travel_plus_wait": result, "table_text": json.dumps(result, indent=2)}
+            # --- Best branch with user-reported traffic delay ---
+    if action == "best_branch_with_delay":
+        month = cmd.get("month") or "December 2025"
+        origin_lat = cmd.get("origin_lat")
+        origin_lon = cmd.get("origin_lon")
+        origin_address = (cmd.get("region") or "").strip()
+        extra_delay = cmd.get("extra_delay_minutes") or 0
+
+        if origin_lat is None or origin_lon is None:
+            if not origin_address:
+                return {
+                    "help": "Please provide an origin address like 'Fallstaff Road, Baltimore, MD' or coordinates."
+                }
+
+            coords = geocode_address(origin_address)
+            if not coords:
+                return {
+                    "help": f"Could not locate address '{origin_address}'. Try a more specific address."
+                }
+
+            origin_lat, origin_lon = coords
+
+        result = best_branch_with_delay(
+            float(origin_lat),
+            float(origin_lon),
+            extra_delay_minutes=float(extra_delay),
+            month=month
+        )
+        return {"best_branch_with_delay": result, "table_text": json.dumps(result, indent=2)}
            # --- Best branch by combined drive + wait time ---
     if action == "best_branch_total_time":
         month = cmd.get("month") or "December 2025"
@@ -569,6 +667,22 @@ def chat(payload: ChatIn):
                 f"Best branch right now is {best['branch']} "
                 f"with an estimated total time of {best['estimated_total_minutes']} minutes "
                 f"({best['drive_eta_minutes']} min driving + {best['historical_wait_minutes']} min wait in {best['wait_month']})."
+            ),
+            "data": tool_out,
+        }
+            if "best_branch_with_delay" in tool_out:
+        r = tool_out["best_branch_with_delay"]
+
+        if "error" in r:
+            return {"command": cmd, "answer": r["error"], "data": tool_out}
+
+        best = r["best_branch"]
+        return {
+            "command": cmd,
+            "answer": (
+                f"Given the extra {best['extra_delay_minutes']} minute traffic delay, the best branch is {best['branch']} "
+                f"with an estimated total time of {best['estimated_total_minutes']} minutes "
+                f"({best['adjusted_drive_minutes']} min driving including delay + {best['historical_wait_minutes']} min wait in {best['wait_month']})."
             ),
             "data": tool_out,
         }
