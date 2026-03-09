@@ -14,14 +14,21 @@ from google import genai
 
 load_dotenv()
 
-MONTHS = ["July 2025","August 2025","September 2025","October 2025","November 2025","December 2025"]
+MONTHS = [
+    "July 2025",
+    "August 2025",
+    "September 2025",
+    "October 2025",
+    "November 2025",
+    "December 2025",
+]
 
 if not os.getenv("GEMINI_API_KEY"):
     raise RuntimeError("GEMINI_API_KEY is not set in environment variables.")
-    
+
 if not os.getenv("MAPBOX_TOKEN"):
     raise RuntimeError("MAPBOX_TOKEN is not set in environment variables.")
-    
+
 MAPBOX_TOKEN = os.getenv("MAPBOX_TOKEN")
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
@@ -35,7 +42,7 @@ if not CSV_PATH.exists():
     )
 
 df = pd.read_csv(CSV_PATH)
-# Coordinates for MVA branches (used for traffic routing)
+
 BRANCH_COORDS = {
     "Annapolis": (38.9784, -76.4922),
     "Baltimore City": (39.2904, -76.6122),
@@ -49,23 +56,23 @@ BRANCH_COORDS = {
     "Parkville": (39.3777, -76.5400),
     "White Oak": (39.0384, -76.9903),
 }
+
 cust_cols = [c for c in df.columns if "Customers Served" in c]
 wait_cols = [c for c in df.columns if "Wait Time" in c]
 
 for c in cust_cols:
     df[c] = (
         df[c].astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace(" ", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.replace(" ", "", regex=False)
     )
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
-# Clean wait time columns  ← ADD THIS HERE
 for c in wait_cols:
     df[c] = (
         df[c].astype(str)
-            .str.replace(",", "", regex=False)
-            .str.replace(" ", "", regex=False)
+        .str.replace(",", "", regex=False)
+        .str.replace(" ", "", regex=False)
     )
     df[c] = pd.to_numeric(df[c], errors="coerce")
 
@@ -75,10 +82,12 @@ for period in ["FY23", "FY24", "FY25"]:
 for m in MONTHS:
     df[f"{m} Efficiency"] = df[f"{m} Customers Served"] / df[f"{m} Wait Time"]
 
-# ---- tools ----
+
+# ---------------------------
+# Helpers / tools
+# ---------------------------
 def _safe_int(x):
     try:
-        # handle pandas NaN
         if pd.isna(x):
             return None
         return int(x)
@@ -95,27 +104,49 @@ def _safe_float(x):
         return None
 
 
-def top_longest_wait(month="December 2025", n=5):
-    return df[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
+def _filter_by_region(data: pd.DataFrame, region: str | None) -> pd.DataFrame:
+    if not region:
+        return data
+    region = region.strip().lower()
+    if not region:
+        return data
+    return data[data["Branch"].astype(str).str.lower().str.contains(region, na=False)]
+
+
+def top_longest_wait(month="December 2025", n=5, region: str | None = None):
+    tmp = _filter_by_region(df, region)
+    return tmp[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
         by=f"{month} Wait Time", ascending=False
     ).head(n)
 
-def top_best_efficiency(month="December 2025", n=5):
-    return df[["Branch", f"{month} Efficiency", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
+
+def top_shortest_wait(month="December 2025", n=5, region: str | None = None):
+    tmp = _filter_by_region(df, region)
+    return tmp[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
+        by=f"{month} Wait Time", ascending=True
+    ).head(n)
+
+
+def top_best_efficiency(month="December 2025", n=5, region: str | None = None):
+    tmp = _filter_by_region(df, region)
+    return tmp[["Branch", f"{month} Efficiency", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
         by=f"{month} Efficiency", ascending=False
     ).head(n)
 
-def biggest_wait_increase(from_period="FY25", to_month="December 2025", n=5):
-    tmp = df.copy()
+
+def biggest_wait_increase(from_period="FY25", to_month="December 2025", n=5, region: str | None = None):
+    tmp = _filter_by_region(df.copy(), region)
     tmp["Wait Change"] = tmp[f"{to_month} Wait Time"] - tmp[f"{from_period} Wait Time"]
-    return tmp[["Branch", f"{from_period} Wait Time", f"{to_month} Wait Time", "Wait Change"]].sort_values(
+    return tmp[[ "Branch", f"{from_period} Wait Time", f"{to_month} Wait Time", "Wait Change"]].sort_values(
         by="Wait Change", ascending=False
     ).head(n)
 
+
 def branch_summary(branch_name: str):
-    row = df[df["Branch"].str.lower() == (branch_name or "").lower()]
+    row = df[df["Branch"].astype(str).str.lower() == (branch_name or "").strip().lower()]
     if row.empty:
         return {"error": f"Branch '{branch_name}' not found."}
+
     r = row.iloc[0]
     return {
         "Branch": r["Branch"],
@@ -139,58 +170,36 @@ def branch_summary(branch_name: str):
                 "served": _safe_int(r[f"{m} Customers Served"]),
                 "wait": _safe_float(r[f"{m} Wait Time"]),
                 "eff": _safe_float(r[f"{m} Efficiency"]),
-            } for m in MONTHS
-        }
+            }
+            for m in MONTHS
+        },
     }
-def _filter_by_region(data: pd.DataFrame, region: str | None) -> pd.DataFrame:
-    """Filter rows by keyword match in Branch name (best we can do unless you have a County column)."""
-    if not region:
-        return data
-    region = region.strip().lower()
-    if not region:
-        return data
-    return data[data["Branch"].astype(str).str.lower().str.contains(region, na=False)]
 
-
-def top_shortest_wait(month="December 2025", n=5, region: str | None = None):
-    tmp = _filter_by_region(df, region)
-    return tmp[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
-        by=f"{month} Wait Time", ascending=True
-    ).head(n)
 
 def geocode_address(address: str):
-    """Convert address (e.g., 'Baltimore, MD') to coordinates using Mapbox."""
-    
     url = f"https://api.mapbox.com/geocoding/v5/mapbox.places/{quote(address, safe='')}.json"
-
-    params = {
-        "access_token": MAPBOX_TOKEN,
-        "limit": 1
-    }
+    params = {"access_token": MAPBOX_TOKEN, "limit": 1}
 
     r = requests.get(url, params=params, timeout=20)
-
     if r.status_code != 200:
         return None
 
     data = r.json()
-    features = data.get("features")
-
+    features = data.get("features", [])
     if not features:
         return None
 
     lon, lat = features[0]["center"]
-
     return lat, lon
 
+
 def traffic_eta_minutes(origin_lat: float, origin_lon: float, branch_name: str):
-    """Returns current traffic ETA (minutes) from origin -> branch using Mapbox driving-traffic."""
     if not branch_name:
         return {"error": "Missing branch name."}
 
-    # case-insensitive match
     key_map = {k.lower(): k for k in BRANCH_COORDS.keys()}
     bkey = key_map.get(branch_name.strip().lower())
+
     if not bkey:
         return {"error": f"No coordinates found for branch '{branch_name}'. Available: {list(BRANCH_COORDS.keys())}"}
 
@@ -200,7 +209,6 @@ def traffic_eta_minutes(origin_lat: float, origin_lon: float, branch_name: str):
         f"https://api.mapbox.com/directions/v5/mapbox/driving-traffic/"
         f"{origin_lon},{origin_lat};{dest_lon},{dest_lat}"
     )
-
     params = {
         "access_token": MAPBOX_TOKEN,
         "overview": "false",
@@ -224,6 +232,7 @@ def traffic_eta_minutes(origin_lat: float, origin_lon: float, branch_name: str):
         "eta_minutes": round(duration_sec / 60, 1),
     }
 
+
 def branch_wait_time(branch_name: str, month: str = "December 2025"):
     if not branch_name:
         return {"error": "Missing branch name."}
@@ -241,80 +250,13 @@ def branch_wait_time(branch_name: str, month: str = "December 2025"):
     except Exception:
         wait = None
 
-    return {"branch": row.iloc[0]["Branch"], "month": month, "wait_minutes": wait}
-# ---- LLM router ----
-ROUTER_INSTRUCTIONS = f"""
-Return ONLY valid JSON (no markdown).
+    return {
+        "branch": row.iloc[0]["Branch"],
+        "month": month,
+        "wait_minutes": wait,
+    }
 
-Schema:
-{{
-"action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency",
-                  "biggest_wait_increase","branch_summary","traffic_eta",
-                  "travel_plus_wait","best_branch_total_time","best_branch_with_delay","help"],
-  "month": one of {MONTHS} or null,
-  "n": integer (default 5) or null,
-  "branch": string or null,
-  "region": string or null,
-  "origin_lat": number or null,
-  "origin_lon": number or null,
-  "extra_delay_minutes": number or null
-}}
 
-Rules:
-- If user asks which branch to go to and mentions an extra traffic jam / delay / added traffic minutes -> best_branch_with_delay
-  - origin address -> "region"
-  - extra delay minutes -> "extra_delay_minutes"
-  - month -> if missing set month=null
-- If user asks "best branch", "fastest branch", "least total time", "shortest total time", "best option for me" considering traffic and wait -> best_branch_total_time
-  - Put origin address in "region" if address is given
-  - Put origin_lat/origin_lon if coordinates are given
-  - If month is missing, set month=null
-- If user asks travel time AND mentions wait time / "historical wait" / "including wait" / "total time" -> travel_plus_wait
-  - destination branch -> "branch"
-  - origin address -> "region" (or add a new field origin_address; see note below)
-  - month -> if missing set month=null
-- If user asks "traffic", "ETA", "drive time", "travel time" -> traffic_eta
-  - Put destination branch name in "branch"
-  - If user gives coordinates, set origin_lat/origin_lon
-  - If user provides an address instead of coordinates (e.g., "Baltimore, MD", "JHU Hospital"), put it in "region"
-- If user asks "longest wait", "highest wait", "worst wait" -> top_longest_wait
-- If user asks "shortest wait", "lowest wait", "least wait", "minimum wait" -> top_shortest_wait
-- If user asks "best efficiency", "most efficient" -> top_best_efficiency
-- If user asks "increase", "got worse" -> biggest_wait_increase (FY25 -> month)
-- If user asks "summary" OR clearly names a single branch -> branch_summary (put branch in "branch")
-- If user mentions a place/area, put it in "region"
-- If user does not specify month, set month=null
-- If user does not specify n, set n=null
-- If unclear -> help
-
-Examples:
-User: "Traffic ETA from 39.29,-76.61 to Largo"
--> {{"action":"traffic_eta","branch":"Largo","origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null,"region":null}}
-
-User: "Traffic ETA from Baltimore, MD to Largo"
--> {{"action":"traffic_eta","branch":"Largo","origin_lat":null,"origin_lon":null,"month":null,"n":null,"region":"Baltimore, MD"}}
-
-User: "How long from 2907 Fallstaff Road, Baltimore, MD to Largo including Largo historical wait time?"
--> {{"action":"travel_plus_wait","branch":"Largo","region":"2907 Fallstaff Road, Baltimore, MD","month":null,"n":null,"origin_lat":null,"origin_lon":null}}
-
-User: "Which MVA branch is best for me from Baltimore, MD considering traffic and wait time?"
--> {{"action":"best_branch_total_time","branch":null,"region":"Baltimore, MD","origin_lat":null,"origin_lon":null,"month":null,"n":null}}
-
-User: "Fastest MVA branch for me from 39.29,-76.61 including wait time"
--> {{"action":"best_branch_total_time","branch":null,"region":null,"origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null}}
-
-User: "I am currently on Fallstaff Road and there is a 10 minute traffic jam. Which branch should I go to?"
--> {{"action":"best_branch_with_delay","branch":null,"region":"Fallstaff Road, Baltimore, MD","origin_lat":null,"origin_lon":null,"extra_delay_minutes":10,"month":null,"n":null}}
-"""
-DELAY_RE = re.compile(r"(\d+)\s*(?:minute|min)\s*(?:traffic jam|delay|extra traffic|jam)", re.I)
-
-def extract_delay_from_text(text: str):
-    m = DELAY_RE.search(text or "")
-    if not m:
-        return None
-    return int(m.group(1))
-    
-COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
 def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str = "December 2025"):
     results = []
 
@@ -325,7 +267,6 @@ def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str =
 
         wait_info = branch_wait_time(branch_name, month=month)
         wait_min = wait_info.get("wait_minutes")
-
         if wait_min is None:
             continue
 
@@ -343,12 +284,13 @@ def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str =
         return {"error": "Could not calculate total time for any branch."}
 
     results = sorted(results, key=lambda x: x["estimated_total_minutes"])
-
     return {
         "best_branch": results[0],
-        "all_ranked_branches": results
+        "all_ranked_branches": results,
     }
-    def best_branch_with_delay(origin_lat: float, origin_lon: float, extra_delay_minutes: float = 0, month: str = "December 2025"):
+
+
+def best_branch_with_delay(origin_lat: float, origin_lon: float, extra_delay_minutes: float = 0, month: str = "December 2025"):
     results = []
 
     for branch_name in BRANCH_COORDS.keys():
@@ -358,7 +300,6 @@ def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str =
 
         wait_info = branch_wait_time(branch_name, month=month)
         wait_min = wait_info.get("wait_minutes")
-
         if wait_min is None:
             continue
 
@@ -379,27 +320,103 @@ def best_branch_by_total_time(origin_lat: float, origin_lon: float, month: str =
         return {"error": "Could not calculate total time for any branch."}
 
     results = sorted(results, key=lambda x: x["estimated_total_minutes"])
-
     return {
         "best_branch": results[0],
-        "all_ranked_branches": results
+        "all_ranked_branches": results,
     }
 
+
+# ---------------------------
+# Intent routing
+# ---------------------------
+ROUTER_INSTRUCTIONS = f"""
+Return ONLY valid JSON (no markdown).
+
+Schema:
+{{
+  "action": one of ["top_longest_wait","top_shortest_wait","top_best_efficiency",
+                    "biggest_wait_increase","branch_summary","traffic_eta",
+                    "travel_plus_wait","best_branch_total_time","best_branch_with_delay","help"],
+  "month": one of {MONTHS} or null,
+  "n": integer (default 5) or null,
+  "branch": string or null,
+  "region": string or null,
+  "origin_lat": number or null,
+  "origin_lon": number or null,
+  "extra_delay_minutes": number or null
+}}
+
+Rules:
+- If user asks which branch to go to and mentions an extra traffic jam / delay / added traffic minutes -> best_branch_with_delay
+  - origin address -> "region"
+  - extra delay minutes -> "extra_delay_minutes"
+  - month -> if missing set month=null
+- If user asks "best branch", "fastest branch", "least total time", "shortest total time", "best option for me" considering traffic and wait -> best_branch_total_time
+  - Put origin address in "region" if address is given
+  - Put origin_lat/origin_lon if coordinates are given
+  - If month is missing, set month=null
+- If user asks travel time AND mentions wait time / "historical wait" / "including wait" / "total time" -> travel_plus_wait
+  - destination branch -> "branch"
+  - origin address -> "region"
+  - month -> if missing set month=null
+- If user asks "traffic", "ETA", "drive time", "travel time" -> traffic_eta
+  - Put destination branch name in "branch"
+  - If user gives coordinates, set origin_lat/origin_lon
+  - If user provides an address instead of coordinates (e.g., "Baltimore, MD", "JHU Hospital"), put it in "region"
+- If user asks "longest wait", "highest wait", "worst wait" -> top_longest_wait
+- If user asks "shortest wait", "lowest wait", "least wait", "minimum wait" -> top_shortest_wait
+- If user asks "best efficiency", "most efficient" -> top_best_efficiency
+- If user asks "increase", "got worse" -> biggest_wait_increase
+- If user asks "summary" OR clearly names a single branch -> branch_summary
+- If user mentions a place/area, put it in "region"
+- If user does not specify month, set month=null
+- If user does not specify n, set n=null
+- If unclear -> help
+
+Examples:
+User: "Traffic ETA from 39.29,-76.61 to Largo"
+-> {{"action":"traffic_eta","branch":"Largo","origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null,"region":null,"extra_delay_minutes":null}}
+
+User: "Traffic ETA from Baltimore, MD to Largo"
+-> {{"action":"traffic_eta","branch":"Largo","origin_lat":null,"origin_lon":null,"month":null,"n":null,"region":"Baltimore, MD","extra_delay_minutes":null}}
+
+User: "How long from 2907 Fallstaff Road, Baltimore, MD to Largo including Largo historical wait time?"
+-> {{"action":"travel_plus_wait","branch":"Largo","region":"2907 Fallstaff Road, Baltimore, MD","month":null,"n":null,"origin_lat":null,"origin_lon":null,"extra_delay_minutes":null}}
+
+User: "Which MVA branch is best for me from Baltimore, MD considering traffic and wait time?"
+-> {{"action":"best_branch_total_time","branch":null,"region":"Baltimore, MD","origin_lat":null,"origin_lon":null,"month":null,"n":null,"extra_delay_minutes":null}}
+
+User: "Fastest MVA branch for me from 39.29,-76.61 including wait time"
+-> {{"action":"best_branch_total_time","branch":null,"region":null,"origin_lat":39.29,"origin_lon":-76.61,"month":null,"n":null,"extra_delay_minutes":null}}
+
+User: "I am currently on Fallstaff Road and there is a 10 minute traffic jam. Which branch should I go to?"
+-> {{"action":"best_branch_with_delay","branch":null,"region":"Fallstaff Road, Baltimore, MD","origin_lat":null,"origin_lon":null,"extra_delay_minutes":10,"month":null,"n":null}}
+"""
+
+DELAY_RE = re.compile(r"(\d+)\s*(?:minute|min)\s*(?:traffic jam|delay|extra traffic|jam)", re.I)
+COORD_RE = re.compile(r"(-?\d{1,2}(?:\.\d+)?)\s*,\s*(-?\d{1,3}(?:\.\d+)?)")
+
+
+def extract_delay_from_text(text: str):
+    m = DELAY_RE.search(text or "")
+    if not m:
+        return None
+    return int(m.group(1))
+
+
 def extract_coords_from_text(text: str):
-    """
-    Returns (lat, lon) if the user typed something like '39.29,-76.61'
-    or None if not found.
-    """
     m = COORD_RE.search(text or "")
     if not m:
         return None
     lat = float(m.group(1))
     lon = float(m.group(2))
     return lat, lon
-    
+
+
 def _extract_json(text: str) -> str:
     m = re.search(r"\{.*\}", text, flags=re.S)
     return m.group(0) if m else text
+
 
 def route_intent(user_text: str) -> dict:
     resp = client.models.generate_content(
@@ -407,10 +424,11 @@ def route_intent(user_text: str) -> dict:
         contents=f"{ROUTER_INSTRUCTIONS}\n\nUser: {user_text}"
     )
     raw = (resp.text or "").strip()
+
     try:
         cmd = json.loads(_extract_json(raw))
     except Exception:
-    cmd = {
+        cmd = {
             "action": "help",
             "month": None,
             "n": None,
@@ -418,23 +436,27 @@ def route_intent(user_text: str) -> dict:
             "region": None,
             "origin_lat": None,
             "origin_lon": None,
-            "extra_delay_minutes": None
+            "extra_delay_minutes": None,
         }
 
-    # Add this here
     if cmd.get("extra_delay_minutes") is None:
         delay = extract_delay_from_text(user_text)
         if delay is not None:
             cmd["extra_delay_minutes"] = delay
 
-    # Existing coordinate extraction
-    if cmd.get("action") in ("traffic_eta", "travel_plus_wait", "best_branch_total_time", "best_branch_with_delay"):
+    if cmd.get("action") in (
+        "traffic_eta",
+        "travel_plus_wait",
+        "best_branch_total_time",
+        "best_branch_with_delay",
+    ):
         if cmd.get("origin_lat") is None or cmd.get("origin_lon") is None:
             coords = extract_coords_from_text(user_text)
             if coords:
                 cmd["origin_lat"], cmd["origin_lon"] = coords
 
     return cmd
+
 
 def explain(user_text: str, tool_result_text: str) -> str:
     prompt = f"""You are a public-service operations analyst.
@@ -451,9 +473,14 @@ Data result:
     )
     return (resp.text or "").strip()
 
+
 def df_to_text(d: pd.DataFrame, max_rows=8) -> str:
     return d.head(max_rows).to_string(index=False)
 
+
+# ---------------------------
+# Tool runner
+# ---------------------------
 def run_tool(cmd: dict):
     action = cmd.get("action")
     month = cmd.get("month") or "December 2025"
@@ -462,23 +489,20 @@ def run_tool(cmd: dict):
     region = cmd.get("region")
     origin_lat = cmd.get("origin_lat")
     origin_lon = cmd.get("origin_lon")
-    
 
-       # --- Combined: drive ETA + historical wait ---
+    if month not in MONTHS:
+        month = "December 2025"
+
+    # Combined: drive ETA + historical wait
     if action == "travel_plus_wait":
-        month = cmd.get("month") or "December 2025"
-        branch = cmd.get("branch")
-        origin_lat = cmd.get("origin_lat")
-        origin_lon = cmd.get("origin_lon")
-        origin_address = (cmd.get("region") or "").strip()  # using region as origin address
+        origin_address = (region or "").strip()
 
         if not branch:
             return {"help": "Please provide a destination branch (e.g., Largo)."}
 
-        # Resolve origin coords:
         if origin_lat is None or origin_lon is None:
             if not origin_address:
-                return {"help": "Please provide an origin address (e.g., '2907 Fallstaff Road, Baltimore, MD') or coordinates."}
+                return {"help": "Please provide an origin address or coordinates."}
 
             coords = geocode_address(origin_address)
             if not coords:
@@ -486,12 +510,10 @@ def run_tool(cmd: dict):
 
             origin_lat, origin_lon = coords
 
-        # 1) Current driving ETA
         traffic = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
         if "error" in traffic:
             return {"travel_plus_wait": {"traffic": traffic}, "table_text": json.dumps(traffic, indent=2)}
 
-        # 2) Historical wait time at destination branch
         wait_info = branch_wait_time(branch, month=month)
         if "error" in wait_info:
             result = {"traffic": traffic, "wait": wait_info}
@@ -510,27 +532,20 @@ def run_tool(cmd: dict):
             "wait_month": wait_info["month"],
             "estimated_total_minutes": total_min,
         }
-
         return {"travel_plus_wait": result, "table_text": json.dumps(result, indent=2)}
-            # --- Best branch with user-reported traffic delay ---
+
+    # Best branch with user-reported traffic delay
     if action == "best_branch_with_delay":
-        month = cmd.get("month") or "December 2025"
-        origin_lat = cmd.get("origin_lat")
-        origin_lon = cmd.get("origin_lon")
-        origin_address = (cmd.get("region") or "").strip()
+        origin_address = (region or "").strip()
         extra_delay = cmd.get("extra_delay_minutes") or 0
 
         if origin_lat is None or origin_lon is None:
             if not origin_address:
-                return {
-                    "help": "Please provide an origin address like 'Fallstaff Road, Baltimore, MD' or coordinates."
-                }
+                return {"help": "Please provide an origin address like 'Fallstaff Road, Baltimore, MD' or coordinates."}
 
             coords = geocode_address(origin_address)
             if not coords:
-                return {
-                    "help": f"Could not locate address '{origin_address}'. Try a more specific address."
-                }
+                return {"help": f"Could not locate address '{origin_address}'. Try a more specific address."}
 
             origin_lat, origin_lon = coords
 
@@ -538,41 +553,29 @@ def run_tool(cmd: dict):
             float(origin_lat),
             float(origin_lon),
             extra_delay_minutes=float(extra_delay),
-            month=month
+            month=month,
         )
         return {"best_branch_with_delay": result, "table_text": json.dumps(result, indent=2)}
-           # --- Best branch by combined drive + wait time ---
+
+    # Best branch by combined drive + wait time
     if action == "best_branch_total_time":
-        month = cmd.get("month") or "December 2025"
-        origin_lat = cmd.get("origin_lat")
-        origin_lon = cmd.get("origin_lon")
-        origin_address = (cmd.get("region") or "").strip()
+        origin_address = (region or "").strip()
 
         if origin_lat is None or origin_lon is None:
             if not origin_address:
-                return {
-                    "help": "Please provide an origin address like 'Baltimore, MD' or coordinates like '39.29,-76.61'."
-                }
+                return {"help": "Please provide an origin address like 'Baltimore, MD' or coordinates like '39.29,-76.61'."}
 
             coords = geocode_address(origin_address)
             if not coords:
-                return {
-                    "help": f"Could not locate address '{origin_address}'. Try a more specific address."
-                }
+                return {"help": f"Could not locate address '{origin_address}'. Try a more specific address."}
 
             origin_lat, origin_lon = coords
 
         result = best_branch_by_total_time(float(origin_lat), float(origin_lon), month=month)
         return {"best_branch_total_time": result, "table_text": json.dumps(result, indent=2)}
-        
-    if month not in MONTHS:
-        month = "December 2025"
 
     if action == "top_longest_wait":
-        d = _filter_by_region(df, region)
-        d = d[["Branch", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
-            by=f"{month} Wait Time", ascending=False
-        ).head(n)
+        d = top_longest_wait(month, n, region=region)
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
 
     if action == "top_shortest_wait":
@@ -580,44 +583,62 @@ def run_tool(cmd: dict):
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
 
     if action == "top_best_efficiency":
-        d = _filter_by_region(df, region)
-        d = d[["Branch", f"{month} Efficiency", f"{month} Wait Time", f"{month} Customers Served"]].sort_values(
-            by=f"{month} Efficiency", ascending=False
-        ).head(n)
+        d = top_best_efficiency(month, n, region=region)
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
 
     if action == "biggest_wait_increase":
-        tmp = _filter_by_region(df.copy(), region)
-        tmp["Wait Change"] = tmp[f"{month} Wait Time"] - tmp["FY25 Wait Time"]
-        d = tmp[["Branch", "FY25 Wait Time", f"{month} Wait Time", "Wait Change"]].sort_values(
-            by="Wait Change", ascending=False
-        ).head(n)
+        d = biggest_wait_increase("FY25", month, n, region=region)
         return {"table": d.to_dict(orient="records"), "table_text": df_to_text(d)}
 
     if action == "branch_summary":
         s = branch_summary(branch or "")
         return {"summary": s, "table_text": json.dumps(s, indent=2)}
 
-    return {"help": "Try: 'Lowest wait time in Baltimore County in December 2025' or 'Best efficiency in November 2025' or 'Summary: Largo'."}
+    if action == "traffic_eta":
+        if not branch:
+            return {"help": "Please provide a destination branch name."}
 
-# ---- API ----
+        origin_address = (region or "").strip()
+        if origin_lat is None or origin_lon is None:
+            if not origin_address:
+                return {"help": "Please provide your origin as coordinates or an address like 'Baltimore, MD'."}
+
+            coords = geocode_address(origin_address)
+            if not coords:
+                return {"help": f"Could not locate address '{origin_address}'."}
+
+            origin_lat, origin_lon = coords
+
+        result = traffic_eta_minutes(float(origin_lat), float(origin_lon), branch)
+        return {"traffic": result, "table_text": json.dumps(result, indent=2)}
+
+    return {
+        "help": "Try: 'Lowest wait time in Baltimore County in December 2025' or 'Best efficiency in November 2025' or 'Summary: Largo' or 'Traffic ETA from Baltimore, MD to Largo'."
+    }
+
+
+# ---------------------------
+# API
+# ---------------------------
 app = FastAPI()
 
-# Allow your website to call this API (CORS)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # later you can restrict to your website domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 class ChatIn(BaseModel):
     message: str
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.post("/chat")
 def chat(payload: ChatIn):
@@ -627,11 +648,9 @@ def chat(payload: ChatIn):
     if "help" in tool_out:
         return {"command": cmd, "answer": tool_out["help"], "data": tool_out}
 
-    # Special handling for combined travel+wait
     if "travel_plus_wait" in tool_out:
         r = tool_out["travel_plus_wait"]
 
-        # handle errors
         if isinstance(r, dict) and "traffic" in r and isinstance(r["traffic"], dict) and "error" in r["traffic"]:
             return {"command": cmd, "answer": r["traffic"]["error"], "data": tool_out}
 
@@ -654,6 +673,24 @@ def chat(payload: ChatIn):
             ),
             "data": tool_out,
         }
+
+    if "best_branch_with_delay" in tool_out:
+        r = tool_out["best_branch_with_delay"]
+
+        if "error" in r:
+            return {"command": cmd, "answer": r["error"], "data": tool_out}
+
+        best = r["best_branch"]
+        return {
+            "command": cmd,
+            "answer": (
+                f"Given the extra {best['extra_delay_minutes']} minute traffic delay, the best branch is {best['branch']} "
+                f"with an estimated total time of {best['estimated_total_minutes']} minutes "
+                f"({best['adjusted_drive_minutes']} min driving including delay + {best['historical_wait_minutes']} min wait in {best['wait_month']})."
+            ),
+            "data": tool_out,
+        }
+
     if "best_branch_total_time" in tool_out:
         r = tool_out["best_branch_total_time"]
 
@@ -670,37 +707,22 @@ def chat(payload: ChatIn):
             ),
             "data": tool_out,
         }
-            if "best_branch_with_delay" in tool_out:
-        r = tool_out["best_branch_with_delay"]
 
-        if "error" in r:
-            return {"command": cmd, "answer": r["error"], "data": tool_out}
-
-        best = r["best_branch"]
-        return {
-            "command": cmd,
-            "answer": (
-                f"Given the extra {best['extra_delay_minutes']} minute traffic delay, the best branch is {best['branch']} "
-                f"with an estimated total time of {best['estimated_total_minutes']} minutes "
-                f"({best['adjusted_drive_minutes']} min driving including delay + {best['historical_wait_minutes']} min wait in {best['wait_month']})."
-            ),
-            "data": tool_out,
-        }
-    # Special handling for traffic
     if "traffic" in tool_out:
         t = tool_out["traffic"]
         if "error" in t:
             return {"command": cmd, "answer": t["error"], "data": tool_out}
+
         return {
             "command": cmd,
             "answer": f"Current driving ETA to {t['branch']}: {t['eta_minutes']} minutes.",
             "data": tool_out,
         }
 
-    # Everything else -> analyst explanation
     answer = explain(payload.message, tool_out.get("table_text", ""))
     return {"command": cmd, "answer": answer, "data": tool_out}
-    
+
+
 @app.get("/")
 def root():
     return {"ok": True, "docs": "/docs", "health": "/health"}
